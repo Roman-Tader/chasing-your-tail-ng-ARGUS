@@ -1,5 +1,6 @@
-sudo apt install dkms git
-git clone https://github.com/aircrack-ng/rtl8812au.git
+git submodule update --init --recursive
 cd rtl8812au
-sudo make dkms_install
-#sudo reboot
+sudo make dkms_install    # bevorzugt, installiert via DKMS
+# Falls dkms_install fehlt:
+sudo make
+sudo make install
