@@ -1,218 +1,166 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install_kismet_rpios.sh - Automates installing and configuring Kismet on Raspberry Pi OS 64-bit.
-#
-# Usage: sudo ./install_kismet_rpios.sh [--interface wlan1] [--skip-arch-check] \
-#        [--enable-service] [--log-dir /path/to/logs]
-#
-# This script performs the following steps:
-#   * Verifies it is running with administrative privileges.
-#   * Optionally ensures the host architecture matches Raspberry Pi OS 64-bit (arm64).
-#   * Adds the official Kismet APT repository (if not already present).
-#   * Installs Kismet and related capture/logging tools (plus a compatibility symlink).
-#   * Adds the invoking user to the "kismet" and "netdev" groups to allow capture access.
-#   * Writes a minimal /etc/kismet/kismet_site.conf configured for the chosen Wi-Fi interface.
-#   * Aligns log locations with the repository configuration (or a custom directory).
-#   * Optionally enables the systemd Kismet service for automatic start at boot.
-#
-# The COMFAST CF-924AC V2 (Realtek 8812/8813 chipset) works with the linuxwifi capture
-# source once its driver supports monitor mode. Ensure the appropriate kernel module is
-# installed before running Kismet.
+# ============================================================================
+# install_kismet_rpios.sh
+# ----------------------------------------------------------------------------
+# Automatisiert die Installation und Konfiguration von Kismet auf Raspberry Pi OS (64-Bit)
+# ----------------------------------------------------------------------------
+# Features:
+#  - Architekturprüfung (arm64)
+#  - Import des offiziellen Kismet-Repos mit GPG-Verifikation
+#  - Installation der Pakete (kismet, logtools, libcap2-bin)
+#  - Sicheres Schreiben von /etc/kismet/kismet_site.conf
+#  - Optionale Service-Aktivierung (--enable-service)
+#  - Robust gegenüber Mehrfachausführung (idempotent)
+#  - Unterstützt Flags: --interface, --skip-arch-check, --enable-service, --dry-run
+# ============================================================================
 
 ARCH_CHECK=true
 CAPTURE_INTERFACE="wlan1"
 ENABLE_SERVICE=false
-LOG_DIR_OVERRIDE=""
+DRY_RUN=false
 
+# --- Argumente parsen --------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --interface)
             shift
-            if [[ $# -eq 0 ]]; then
-                echo "ERROR: --interface requires a value" >&2
-                exit 1
-            fi
+            [[ $# -gt 0 ]] || { echo "ERROR: --interface benötigt Wert" >&2; exit 1; }
             CAPTURE_INTERFACE="$1"
             ;;
-        --skip-arch-check)
-            ARCH_CHECK=false
-            ;;
-        --enable-service)
-            ENABLE_SERVICE=true
-            ;;
-        --log-dir)
-            shift
-            if [[ $# -eq 0 ]]; then
-                echo "ERROR: --log-dir requires a value" >&2
-                exit 1
-            fi
-            LOG_DIR_OVERRIDE="$1"
-            ;;
+        --skip-arch-check) ARCH_CHECK=false ;;
+        --enable-service)  ENABLE_SERVICE=true ;;
+        --dry-run)         DRY_RUN=true ;;
         -h|--help)
-            sed -n '1,40p' "$0"
+            grep -E '^#' "$0" | sed 's/^# //'
             exit 0
             ;;
         *)
-            echo "Unknown argument: $1" >&2
+            echo "Unbekanntes Argument: $1" >&2
             exit 1
             ;;
     esac
     shift
 done
 
+# --- Root-Rechte prüfen ------------------------------------------------------
 if [[ $(id -u) -ne 0 ]]; then
-    echo "Please run this script with sudo or as root." >&2
+    echo "Bitte mit sudo oder als root ausführen." >&2
     exit 1
 fi
 
+# --- Architektur prüfen ------------------------------------------------------
 if $ARCH_CHECK; then
     ARCH=$(dpkg --print-architecture)
     if [[ "$ARCH" != "arm64" ]]; then
-        echo "WARNING: Expected arm64 architecture for Raspberry Pi OS 64-bit but detected '$ARCH'." >&2
-        echo "Re-run with --skip-arch-check if this is intentional." >&2
+        echo "WARNUNG: Erwartet arm64, gefunden '$ARCH'." >&2
+        echo "Nutze --skip-arch-check, falls bewusst." >&2
         exit 1
     fi
 fi
 
-if ! command -v lsb_release >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y lsb-release
+# --- Interface prüfen --------------------------------------------------------
+if ! ip link show "$CAPTURE_INTERFACE" >/dev/null 2>&1; then
+    echo "ERROR: Interface '$CAPTURE_INTERFACE' nicht gefunden." >&2
+    exit 2
 fi
 
-if [[ -r /etc/os-release ]]; then
-    . /etc/os-release
-    if [[ "${ID:-}" != "raspbian" && "${ID:-}" != "debian" ]]; then
-        echo "WARNING: Detected ID='${ID:-unknown}' in /etc/os-release; this script targets Raspberry Pi OS." >&2
-    fi
+# --- Dry-Run-Mode ------------------------------------------------------------
+if $DRY_RUN; then
+    echo "🔍 Dry-Run: keine Änderungen, nur Prüfung."
 fi
 
+# --- Apt-Setup ---------------------------------------------------------------
+export DEBIAN_FRONTEND=noninteractive
+$DRY_RUN || apt-get update -y
+$DRY_RUN || apt-get install -y curl gnupg apt-transport-https ca-certificates lsb-release libcap2-bin
+
+# --- Repo vorbereiten --------------------------------------------------------
+install -d -m 0755 /usr/share/keyrings
+KEYRING=/usr/share/keyrings/kismet-archive-keyring.gpg
+REPO_LIST=/etc/apt/sources.list.d/kismet.list
 CODENAME=$(lsb_release -sc)
 SUPPORTED_CODENAMES=(bullseye bookworm)
 REPO_CODENAME="$CODENAME"
 if [[ ! " ${SUPPORTED_CODENAMES[*]} " =~ " ${CODENAME} " ]]; then
-    echo "WARNING: Raspberry Pi OS codename '$CODENAME' not explicitly supported. Falling back to 'bookworm'." >&2
+    echo "WARN: Codename '$CODENAME' nicht offiziell unterstützt, nutze 'bookworm'."
     REPO_CODENAME="bookworm"
 fi
 
-apt-get update
-apt-get install -y curl gnupg apt-transport-https ca-certificates
-
-KEYRING=/usr/share/keyrings/kismet-archive-keyring.gpg
-REPO_LIST=/etc/apt/sources.list.d/kismet.list
-
 if [[ ! -f "$KEYRING" ]]; then
-    echo "Importing Kismet repository signing key..."
-    curl -fsSL https://www.kismetwireless.net/repos/kismet-release.gpg | gpg --dearmor -o "$KEYRING"
+    echo "Importiere GPG-Key für Kismet-Repository…"
+    $DRY_RUN || curl -fsSL https://www.kismetwireless.net/repos/kismet-release.gpg | gpg --dearmor -o "$KEYRING"
 fi
 
-echo "Configuring Kismet APT repository for '$REPO_CODENAME'..."
-cat <<REPO | tee "$REPO_LIST" >/dev/null
-deb [signed-by=$KEYRING] https://www.kismetwireless.net/repos/apt/release $REPO_CODENAME main
-REPO
-
-apt-get update
-apt-get install -y kismet kismet-logtools libcap2-bin
-
-if [[ ! -e /usr/local/bin/kismet && -x /usr/bin/kismet ]]; then
-    echo "Creating compatibility symlink at /usr/local/bin/kismet for existing helper scripts..."
-    ln -s /usr/bin/kismet /usr/local/bin/kismet
+if ! grep -q "kismetwireless.net" "$REPO_LIST" 2>/dev/null; then
+    echo "deb [signed-by=$KEYRING] https://www.kismetwireless.net/repos/apt/release $REPO_CODENAME main" | tee "$REPO_LIST" >/dev/null
 fi
 
-TARGET_USER=${SUDO_USER:-$(logname 2>/dev/null || echo "")}
+$DRY_RUN || apt-get update -y
+$DRY_RUN || apt-get install -y kismet kismet-logtools
+
+# --- Benutzergruppen ---------------------------------------------------------
+TARGET_USER=${SUDO_USER:-${USER:-$(id -un)}}
 if [[ -n "$TARGET_USER" ]]; then
-    echo "Adding $TARGET_USER to kismet and netdev groups..."
-    usermod -aG kismet "$TARGET_USER"
-    usermod -aG netdev "$TARGET_USER"
+    echo "Füge $TARGET_USER zu Gruppen 'kismet' und 'netdev' hinzu…"
+    $DRY_RUN || usermod -aG kismet "$TARGET_USER"
+    $DRY_RUN || usermod -aG netdev "$TARGET_USER"
 fi
 
+# --- Konfiguration -----------------------------------------------------------
 SITE_CONF=/etc/kismet/kismet_site.conf
 if [[ -f "$SITE_CONF" ]]; then
     cp "$SITE_CONF" "${SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
 fi
 
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-CONFIG_FILE="$SCRIPT_DIR/config.json"
-PYTHON_BIN=$(command -v python3 || true)
-
-determine_log_dir() {
-    if [[ -n "$LOG_DIR_OVERRIDE" ]]; then
-        printf '%s\n' "$LOG_DIR_OVERRIDE"
-        return
-    fi
-
-    if [[ -n "$PYTHON_BIN" && -f "$CONFIG_FILE" ]]; then
-        local parsed
-        parsed=$("$PYTHON_BIN" - "$CONFIG_FILE" <<'PY'
-import json, os, sys
-config_path = sys.argv[1]
-try:
-    with open(config_path, 'r', encoding='utf-8') as handle:
-        data = json.load(handle)
-    raw_path = data.get('paths', {}).get('kismet_logs')
-    if raw_path:
-        # Remove wildcard suffixes (e.g., *.kismet)
-        candidate = os.path.dirname(raw_path)
-        if candidate:
-            print(candidate)
-except (OSError, json.JSONDecodeError):
-    pass
-PY
-)
-        if [[ -n "$parsed" ]]; then
-            printf '%s\n' "$parsed"
-            return
-        fi
-    fi
-
-    if [[ -n "$TARGET_USER" ]]; then
-        printf '/home/%s/kismet_logs\n' "$TARGET_USER"
-    else
-        printf '/var/log/kismet\n'
-    fi
-}
-
-LOG_DIR=$(determine_log_dir)
-LOG_PREFIX="$LOG_DIR/kismet"
-
-if ! ip link show "$CAPTURE_INTERFACE" >/dev/null 2>&1; then
-    echo "WARNING: Capture interface '$CAPTURE_INTERFACE' not found. Update --interface after connecting the adapter." >&2
-fi
-
-cat <<EOFCONF >"$SITE_CONF"
-# Auto-generated by install_kismet_rpios.sh on $(date)
-# Configure the COMFAST CF-924AC V2 (or other interface) for monitor mode capture.
-# Adjust 'interface' if your adapter enumerates differently.
+echo "Schreibe neue $SITE_CONF …"
+$DRY_RUN || cat <<EOFCONF >"$SITE_CONF"
+# Auto-generiert durch install_kismet_rpios.sh am $(date)
 source=linuxwifi:name=cf-924ac-v2,interface=$CAPTURE_INTERFACE
-
-# Optional: enable logging to the default directory and disable old log formats.
-log_prefix=$LOG_PREFIX
+log_prefix=/var/log/kismet/kismet
 write_interval=30
 log_types=pcapng,pcapng-remote,kismetdb
 EOFCONF
+$DRY_RUN || chmod 640 "$SITE_CONF"
+$DRY_RUN || chown root:kismet "$SITE_CONF"
 
-# Ensure the log directory exists with appropriate permissions.
-install -d -m 0755 "$LOG_DIR"
-chown kismet:kismet "$LOG_DIR"
+# --- Log-Verzeichnis ---------------------------------------------------------
+install -d -m 0755 /var/log/kismet
+$DRY_RUN || chown kismet:kismet /var/log/kismet
 
-# Enable or restart the Kismet service to apply settings when systemd is available.
+# --- Service-Handling --------------------------------------------------------
 if command -v systemctl >/dev/null 2>&1; then
     if $ENABLE_SERVICE; then
-        systemctl enable kismet.service
+        echo "Aktiviere und starte Kismet-Service…"
+        $DRY_RUN || systemctl enable --now kismet.service
+    else
+        echo "Starte Kismet einmalig neu (Service bleibt deaktiviert)…"
+        $DRY_RUN || systemctl restart kismet.service || true
     fi
-    systemctl restart kismet.service
 else
-    echo "systemctl not available; skipping service enablement."
+    echo "Kein systemd vorhanden – Service-Handling übersprungen."
 fi
 
-# Set capture helper capabilities so Kismet can configure monitor mode.
+# --- setcap für Capture-Helper ----------------------------------------------
 if command -v kismet_cap_linux_wifi >/dev/null 2>&1; then
-    setcap cap_net_admin,cap_net_raw+eip "$(command -v kismet_cap_linux_wifi)"
+    echo "Setze capabilities für kismet_cap_linux_wifi…"
+    $DRY_RUN || setcap cap_net_admin,cap_net_raw+eip "$(command -v kismet_cap_linux_wifi)" || true
 fi
 
-echo "Kismet installation and configuration complete."
-if [[ -n "$TARGET_USER" ]]; then
-    echo "Log out and back in for group membership changes to take effect." 
+# --- Monitor-Mode-Check ------------------------------------------------------
+if ! iw list 2>/dev/null | grep -A5 "Supported interface modes" | grep -q monitor; then
+    echo "WARNUNG: Adapter unterstützt laut Treiber keinen Monitor-Mode!"
 fi
 
-echo "Access the web UI at: http://localhost:2501"
+# --- Abschlussmeldung --------------------------------------------------------
+if $DRY_RUN; then
+    echo "✅ Dry-Run abgeschlossen – keine Änderungen vorgenommen."
+else
+    echo "✅ Installation und Konfiguration abgeschlossen."
+    echo "🔹 Web-UI: http://localhost:2501"
+    echo "🔹 Log-Dir: /var/log/kismet"
+    echo "🔹 Config:  $SITE_CONF"
+    echo "Logge dich einmal aus/ein, damit Gruppenrechte greifen."
+    logger -t install_kismet_rpios "Kismet installation completed for $CAPTURE_INTERFACE"
+fi
